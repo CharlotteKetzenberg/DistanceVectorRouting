@@ -109,9 +109,9 @@ def format_distance_vector_with_poison_reverse(node_id, distance_vector, routing
         node_id: str
             The ID of this node
         distance_vector: dict
-            Dictionary mapping destination node_id to cost
+            Dictionary mapping destination node_id -> cost
         routing_table: dict
-            Dictionary mapping destination node_id to next hop
+            Dictionary mapping destination node_id -> next_hop node_id
         target_neighbor: str
             The neighbor this vector will be sent to
             
@@ -120,13 +120,17 @@ def format_distance_vector_with_poison_reverse(node_id, distance_vector, routing
             The formatted distance vector as bytes with poison reverse applied
     """
     # Create a copy of the distance vector to modify
-    poisoned_vector = distance_vector.copy()
+    poisoned_vector = {}
     
-    # Apply poison reverse: if we route to a destination through this neighbor,
-    # tell the neighbor that our distance to that destination is infinity (999)
-    for dest, next_hop in routing_table.items():
-        if next_hop == target_neighbor:
-            poisoned_vector[dest] = 999  # Infinity (for practical purposes)
+    # For every destination in our distance vector
+    for dest, cost in distance_vector.items():
+        next_hop = routing_table.get(dest)
+        # If we route to this destination through this neighbor, poison the route
+        if next_hop == target_neighbor and dest != target_neighbor:
+            poisoned_vector[dest] = 999  # Infinity
+        else:
+            # Otherwise, advertise the actual cost
+            poisoned_vector[dest] = cost
     
     # Format: "<your_node_id>|dest1:cost1,dest2:cost2,..."
     vector_parts = []
@@ -203,8 +207,8 @@ def update_tables(node_id, sender_id, sender_vector, distance_vector, routing_ta
     changed = False
     
     # Cost to reach the sender node
-    cost_to_sender = neighbors.get(sender_id)
-    if cost_to_sender is None:
+    cost_to_sender = int(neighbors.get(sender_id, float('inf')))
+    if cost_to_sender == float('inf'):
         return False  # Sender is not a direct neighbor
     
     # For each destination in sender's vector
@@ -213,7 +217,10 @@ def update_tables(node_id, sender_id, sender_vector, distance_vector, routing_ta
         if dest == node_id:
             continue
             
-        # Skip if the cost is infinity (999 in our implementation)
+        # Convert to int to ensure proper comparison
+        dest_cost = int(dest_cost)
+        
+        # Skip infinity costs (999 or higher in our implementation)
         if dest_cost >= 999:
             continue
             
@@ -222,7 +229,7 @@ def update_tables(node_id, sender_id, sender_vector, distance_vector, routing_ta
         
         # If we don't know this destination yet, or the new route is better
         current_cost = distance_vector.get(dest, float('inf'))
-        if dest not in distance_vector or potential_cost < current_cost:
+        if current_cost == float('inf') or potential_cost < current_cost:
             # Update distance vector
             distance_vector[dest] = potential_cost
             # Update routing table with sender as next hop
@@ -250,6 +257,10 @@ def log_state(node_id, distance_vector, routing_table, log_file):
     
     # Sort the destinations for consistent output
     for dest in sorted(distance_vector.keys()):
+        # Skip logging ourselves
+        if dest == node_id:
+            continue
+            
         cost = distance_vector[dest]
         next_hop = routing_table.get(dest, "unknown")
         log_entries.append(f"{dest}:{cost}:{next_hop}")
@@ -295,8 +306,8 @@ if __name__ == '__main__':
         neighbor_pairs = neighbors_info.split(',')
         for pair in neighbor_pairs:
             if ':' in pair:
-                neighbor_id, cost = pair.split(':')
-                cost = int(cost)
+                neighbor_id, cost_str = pair.split(':')
+                cost = int(cost_str)  # Ensure cost is an integer
                 
                 # Update neighbors dictionary
                 neighbors[neighbor_id] = cost
@@ -314,38 +325,43 @@ if __name__ == '__main__':
     log_state(node_id, distance_vector, routing_table, log_file)
     
     # Main DVR loop
+    # In the main loop:
     try:
         while True:
-            # Broadcast distance vector to all neighbors
-            # Use poison reverse for each neighbor separately
+            # Broadcast distance vector to all neighbors with poison reverse
             for neighbor_id in neighbors:
                 poisoned_message = format_distance_vector_with_poison_reverse(
                     node_id, distance_vector, routing_table, neighbor_id
                 )
                 net_interface.send(poisoned_message)
             
-            # Receive and process incoming distance vectors
-            try:
-                message = net_interface.recv(4096)
-                
-                if message:
-                    # Parse the received vector
-                    sender_id, sender_vector = parse_received_vector(message)
-                    
-                    if sender_id and sender_id in neighbors:
-                        # Update tables based on received vector
-                        changed = update_tables(
-                            node_id, sender_id, sender_vector, 
-                            distance_vector, routing_table, neighbors
-                        )
-                        
-                        # If tables changed, log the new state
-                        if changed:
-                            log_state(node_id, distance_vector, routing_table, log_file)
+            # Process multiple messages to speed up convergence
+            changes_made = False
             
-            except socket.timeout:
-                # No message received within timeout period, continue with the loop
-                pass
+            # Try to receive multiple messages
+            for _ in range(3):  # Try a few times to receive messages
+                try:
+                    message = net_interface.recv(4096)
+                    
+                    if message:
+                        # Parse the received vector
+                        sender_id, sender_vector = parse_received_vector(message)
+                        
+                        if sender_id and sender_id in neighbors:
+                            # Update tables based on received vector
+                            changed = update_tables(
+                                node_id, sender_id, sender_vector, 
+                                distance_vector, routing_table, neighbors
+                            )
+                            
+                            # If tables changed, log the new state
+                            if changed:
+                                changes_made = True
+                                log_state(node_id, distance_vector, routing_table, log_file)
+                
+                except socket.timeout:
+                    # No message received within timeout period
+                    break
             
             # Brief sleep to control update rate
             time.sleep(0.3)
